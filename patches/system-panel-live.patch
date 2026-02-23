@@ -1,0 +1,769 @@
+commit ee703208552df6f9790bca29aebde095757a30b2
+Author: 삼플 <leeingil76@gmail.com>
+Date:   Tue Feb 24 01:25:01 2026 +0900
+
+    feat(system): add live system panel metrics and linux sensor symlink support
+
+diff --git a/server/modules/routes/ops.ts b/server/modules/routes/ops.ts
+index 82d80cd..6b75da4 100644
+--- a/server/modules/routes/ops.ts
++++ b/server/modules/routes/ops.ts
+@@ -175,6 +175,307 @@ export function registerRoutesPartC(ctx: RuntimeContext): RouteOpsExports {
+ 
+   Object.assign(__ctx, registerOpsMessageRoutes(__ctx));
+ 
++  const SYSTEM_METRICS_CACHE_TTL_MS = 5 * 60_000;
++  const SYSTEM_METRICS_MANUAL_COOLDOWN_MS = 30_000;
++  const SYSTEM_METRICS_COLLECTION_TIMEOUT_MS = 4_500;
++
++  let systemMetricsCache = null as null | { payload: any; cachedAt: number };
++  let systemMetricsCollectionInFlight = null as null | Promise<{ payload: any; collectedAt: number }>;
++  let systemMetricsLastManualRefreshAt = 0;
++
++  const roundTo = (value: number, digits = 1): number => {
++    const base = 10 ** digits;
++    return Math.round(value * base) / base;
++  };
++
++  const withTimeout = <T,>(promise: Promise<T>, timeoutMs: number, timeoutCode: string): Promise<T> =>
++    new Promise<T>((resolve, reject) => {
++      const timer = setTimeout(() => reject(new Error(timeoutCode)), timeoutMs);
++      promise
++        .then((value) => {
++          clearTimeout(timer);
++          resolve(value);
++        })
++        .catch((err) => {
++          clearTimeout(timer);
++          reject(err);
++        });
++    });
++
++  const normalizeTemperatureValue = (raw: string): number | null => {
++    const parsed = Number.parseFloat(raw.trim());
++    if (!Number.isFinite(parsed)) return null;
++    let celsius = parsed;
++    if (Math.abs(celsius) > 10_000) celsius /= 1000;
++    else if (Math.abs(celsius) > 250) celsius /= 10;
++    if (!Number.isFinite(celsius)) return null;
++    if (celsius < -50 || celsius > 180) return null;
++    return roundTo(celsius, 1);
++  };
++
++  const canReadPath = async (filePath: string): Promise<boolean> => {
++    try {
++      await fs.promises.access(filePath, fs.constants.R_OK);
++      return true;
++    } catch {
++      return false;
++    }
++  };
++
++  const collectLinuxTemperatureReadings = async (): Promise<Array<{ celsius: number; source: string }>> => {
++    const readings: Array<{ celsius: number; source: string }> = [];
++
++    const pushReading = async (tempPath: string): Promise<void> => {
++      if (!(await canReadPath(tempPath))) return;
++      const raw = await fs.promises.readFile(tempPath, "utf8");
++      const celsius = normalizeTemperatureValue(raw);
++      if (celsius == null) return;
++      readings.push({ celsius, source: tempPath });
++    };
++
++    const thermalRoot = "/sys/class/thermal";
++    if (await canReadPath(thermalRoot)) {
++      const entries = await fs.promises.readdir(thermalRoot, { withFileTypes: true }).catch(() => []);
++      for (const entry of entries) {
++        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
++        if (!entry.name.startsWith("thermal_zone")) continue;
++        await pushReading(path.join(thermalRoot, entry.name, "temp"));
++      }
++    }
++
++    const hwmonRoot = "/sys/class/hwmon";
++    if (await canReadPath(hwmonRoot)) {
++      const entries = await fs.promises.readdir(hwmonRoot, { withFileTypes: true }).catch(() => []);
++      for (const entry of entries) {
++        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
++        if (!entry.name.startsWith("hwmon")) continue;
++        const basePath = path.join(hwmonRoot, entry.name);
++        const names = await fs.promises.readdir(basePath).catch(() => []);
++        for (const name of names) {
++          if (!/^temp\d+_input$/.test(name)) continue;
++          await pushReading(path.join(basePath, name));
++        }
++      }
++    }
++
++    return readings;
++  };
++
++  const resolveTemperatureMetric = async (
++    platformName: NodeJS.Platform,
++    warnings: Array<{ code: string; message: string; detail?: string }>,
++  ): Promise<{ supported: boolean; celsius: number | null; source: string | null }> => {
++    if (platformName !== "linux") {
++      warnings.push({
++        code: "TEMP_UNSUPPORTED_PLATFORM",
++        message: `Temperature sensor collection is unsupported on ${platformName}`,
++      });
++      return { supported: false, celsius: null, source: null };
++    }
++
++    try {
++      const readings = await withTimeout(
++        collectLinuxTemperatureReadings(),
++        SYSTEM_METRICS_COLLECTION_TIMEOUT_MS,
++        "temperature_collection_timeout",
++      );
++      if (readings.length === 0) {
++        warnings.push({
++          code: "TEMP_UNSUPPORTED_SENSOR",
++          message: "No readable temperature sensors were found",
++        });
++        return { supported: false, celsius: null, source: null };
++      }
++      const hottest = readings.reduce((prev, curr) => (curr.celsius > prev.celsius ? curr : prev));
++      return { supported: true, celsius: hottest.celsius, source: hottest.source };
++    } catch (err) {
++      const detail = err instanceof Error ? err.message : String(err);
++      warnings.push({
++        code: detail === "temperature_collection_timeout" ? "TEMP_READ_TIMEOUT" : "TEMP_READ_FAILED",
++        message: detail === "temperature_collection_timeout" ? "Temperature read timed out" : "Temperature read failed",
++        detail,
++      });
++      return { supported: false, celsius: null, source: null };
++    }
++  };
++
++  const buildSystemMetricsPayload = async () => {
++    const warnings: Array<{ code: string; message: string; detail?: string }> = [];
++    const cpus = os.cpus();
++    const cores = cpus.length > 0 ? cpus.length : 1;
++    const loadAvg = os.loadavg();
++    const totalMem = os.totalmem();
++    const freeMem = os.freemem();
++    const usedMem = Math.max(totalMem - freeMem, 0);
++    const processMem = process.memoryUsage();
++    const platformName = os.platform();
++    const temperature = await resolveTemperatureMetric(platformName, warnings);
++
++    return {
++      generated_at: Date.now(),
++      cache_ttl_seconds: Math.floor(SYSTEM_METRICS_CACHE_TTL_MS / 1000),
++      warnings,
++      metrics: {
++        host: {
++          hostname: os.hostname(),
++          platform: platformName,
++          release: os.release(),
++          arch: os.arch(),
++        },
++        cpu: {
++          cores,
++          load_average_1m: roundTo(loadAvg[0] ?? 0, 2),
++          load_average_5m: roundTo(loadAvg[1] ?? 0, 2),
++          load_average_15m: roundTo(loadAvg[2] ?? 0, 2),
++          load_percent_1m: roundTo(Math.min(100, Math.max(0, ((loadAvg[0] ?? 0) / cores) * 100)), 1),
++        },
++        memory: {
++          total_bytes: totalMem,
++          free_bytes: freeMem,
++          used_bytes: usedMem,
++          used_percent: totalMem > 0 ? roundTo((usedMem / totalMem) * 100, 1) : 0,
++        },
++        uptime: {
++          seconds: Math.max(0, Math.floor(os.uptime())),
++        },
++        temperature,
++        process: {
++          pid: process.pid,
++          uptime_seconds: Math.max(0, Math.floor(process.uptime())),
++          rss_bytes: processMem.rss,
++          heap_total_bytes: processMem.heapTotal,
++          heap_used_bytes: processMem.heapUsed,
++        },
++      },
++    };
++  };
++
++  const collectAndCacheSystemMetrics = async (): Promise<{ payload: any; collectedAt: number }> => {
++    if (systemMetricsCollectionInFlight) return systemMetricsCollectionInFlight;
++    systemMetricsCollectionInFlight = (async () => {
++      const payload = await withTimeout(
++        buildSystemMetricsPayload(),
++        SYSTEM_METRICS_COLLECTION_TIMEOUT_MS + 1_000,
++        "system_metrics_collection_timeout",
++      );
++      const collectedAt = Date.now();
++      systemMetricsCache = { payload, cachedAt: collectedAt };
++      return { payload, collectedAt };
++    })().finally(() => {
++      systemMetricsCollectionInFlight = null;
++    });
++    return systemMetricsCollectionInFlight;
++  };
++
++  const buildSystemMetricsResponse = (
++    payload: any,
++    cachedAt: number,
++    opts: {
++      now: number;
++      cached: boolean;
++      source: "cache" | "fresh" | "manual_refresh" | "stale_cache";
++      staleReason?: string;
++    },
++  ) => {
++    const stale = opts.now > cachedAt + SYSTEM_METRICS_CACHE_TTL_MS;
++    const warnings = [...(payload.warnings ?? [])];
++    if (stale) {
++      warnings.push({
++        code: "STALE_DATA",
++        message: "Cache TTL has expired; a refresh is recommended",
++      });
++    }
++    if (opts.staleReason) {
++      warnings.push({
++        code: "STALE_CACHE_FALLBACK",
++        message: "Serving stale cached metrics because fresh collection failed",
++        detail: opts.staleReason,
++      });
++    }
++
++    return {
++      status: stale ? "stale" : warnings.length > 0 ? "partial" : "ok",
++      generated_at: payload.generated_at,
++      cache_ttl_seconds: payload.cache_ttl_seconds,
++      warnings,
++      metrics: payload.metrics,
++      cached: opts.cached,
++      stale,
++      source: opts.source,
++      age_ms: Math.max(opts.now - cachedAt, 0),
++      cache_expires_at: cachedAt + SYSTEM_METRICS_CACHE_TTL_MS,
++      manual_refresh: {
++        cooldown_ms: SYSTEM_METRICS_MANUAL_COOLDOWN_MS,
++        cooldown_remaining_ms: Math.max(
++          0,
++          systemMetricsLastManualRefreshAt + SYSTEM_METRICS_MANUAL_COOLDOWN_MS - opts.now,
++        ),
++        in_progress: Boolean(systemMetricsCollectionInFlight),
++      },
++    };
++  };
++
++  const handleSystemMetrics = async (req: any, res: any) => {
++    const now = Date.now();
++    const refresh = String(req.query?.refresh ?? "") === "1";
++    const cached = systemMetricsCache;
++    const hasFreshCache = Boolean(cached && (now - cached.cachedAt) < SYSTEM_METRICS_CACHE_TTL_MS);
++
++    if (!refresh && hasFreshCache && cached) {
++      return res.json(buildSystemMetricsResponse(cached.payload, cached.cachedAt, {
++        now,
++        cached: true,
++        source: "cache",
++      }));
++    }
++
++    if (refresh) {
++      if (systemMetricsCollectionInFlight) {
++        return res.status(409).json({
++          error: "refresh_in_progress",
++          message: "System metrics refresh is already running",
++          retry_after_ms: 1000,
++        });
++      }
++      const remaining = Math.max(0, systemMetricsLastManualRefreshAt + SYSTEM_METRICS_MANUAL_COOLDOWN_MS - now);
++      if (remaining > 0) {
++        return res.status(429).json({
++          error: "manual_refresh_cooldown",
++          message: "Manual refresh is on cooldown",
++          cooldown_remaining_ms: remaining,
++        });
++      }
++      systemMetricsLastManualRefreshAt = now;
++    }
++
++    try {
++      const { payload, collectedAt } = await collectAndCacheSystemMetrics();
++      return res.json(buildSystemMetricsResponse(payload, collectedAt, {
++        now: Date.now(),
++        cached: false,
++        source: refresh ? "manual_refresh" : "fresh",
++      }));
++    } catch (err) {
++      const detail = err instanceof Error ? err.message : String(err);
++      if (cached) {
++        return res.json(buildSystemMetricsResponse(cached.payload, cached.cachedAt, {
++          now: Date.now(),
++          cached: true,
++          source: "stale_cache",
++          staleReason: detail,
++        }));
++      }
++      return res.status(503).json({
++        error: "system_metrics_unavailable",
++        message: "Unable to collect system metrics",
++        detail,
++      });
++    }
++  };
++
++  app.get("/api/system/metrics", handleSystemMetrics);
++  app.get("/api/system/status", handleSystemMetrics);
++
+ // ---------------------------------------------------------------------------
+ // CLI Status
+ // ---------------------------------------------------------------------------
+diff --git a/src/App.tsx b/src/App.tsx
+index 2bc8880..996af0d 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -3,6 +3,7 @@ import Sidebar from "./components/Sidebar";
+ import OfficeView from "./components/OfficeView";
+ import { ChatPanel } from "./components/ChatPanel";
+ import Dashboard from "./components/Dashboard";
++import SystemStatusPanel from "./components/SystemStatusPanel";
+ import TaskBoard from "./components/TaskBoard";
+ import AgentDetail from "./components/AgentDetail";
+ import SettingsPanel from "./components/SettingsPanel";
+@@ -68,7 +69,7 @@ export interface CeoOfficeCall {
+   holdUntil?: number;
+ }
+ 
+-type View = "office" | "dashboard" | "tasks" | "skills" | "settings";
++type View = "office" | "dashboard" | "tasks" | "system" | "skills" | "settings";
+ type TaskPanelTab = "terminal" | "minutes";
+ type RuntimeOs = "windows" | "mac" | "linux" | "unknown";
+ 
+@@ -1686,6 +1687,13 @@ export default function App() {
+           ja: "タスク管理",
+           zh: "任务管理",
+         })}`;
++      case "system":
++        return `🖥️ ${pickLang(uiLanguage, {
++          ko: "시스템 패널",
++          en: "System Panel",
++          ja: "システムパネル",
++          zh: "系统面板",
++        })}`;
+       case "skills":
+         return `📚 ${pickLang(uiLanguage, {
+           ko: "문서고",
+@@ -2199,6 +2207,8 @@ export default function App() {
+               />
+             )}
+ 
++            {view === "system" && <SystemStatusPanel />}
++
+             {view === "skills" && <SkillsLibrary agents={agents} />}
+ 
+             {view === "settings" && (
+diff --git a/src/api.ts b/src/api.ts
+index 56fc603..1abea2a 100644
+--- a/src/api.ts
++++ b/src/api.ts
+@@ -6,7 +6,8 @@ import type {
+   MeetingPresence,
+   Project,
+   CliModelInfo,
+-  RoomTheme
++  RoomTheme,
++  SystemMetricsResponse,
+ } from './types';
+ 
+ const base = '';
+@@ -729,6 +730,16 @@ export async function getStats(): Promise<CompanyStats> {
+   return j.stats;
+ }
+ 
++export async function getSystemMetrics(refresh?: boolean): Promise<SystemMetricsResponse> {
++  const q = refresh ? '?refresh=1' : '';
++  return request<SystemMetricsResponse>(`/api/system/metrics${q}`);
++}
++
++export async function getSystemStatus(refresh?: boolean): Promise<SystemMetricsResponse> {
++  const q = refresh ? '?refresh=1' : '';
++  return request<SystemMetricsResponse>(`/api/system/status${q}`);
++}
++
+ // Settings
+ export async function getSettings(): Promise<CompanySettings> {
+   const j = await request<{ settings: CompanySettings }>('/api/settings');
+diff --git a/src/components/Sidebar.tsx b/src/components/Sidebar.tsx
+index 1013e06..cc94a76 100644
+--- a/src/components/Sidebar.tsx
++++ b/src/components/Sidebar.tsx
+@@ -2,7 +2,7 @@ import { useState } from "react";
+ import type { Department, Agent, CompanySettings } from "../types";
+ import { useI18n } from "../i18n";
+ 
+-type View = "office" | "dashboard" | "tasks" | "skills" | "settings";
++type View = "office" | "dashboard" | "tasks" | "system" | "skills" | "settings";
+ 
+ interface SidebarProps {
+   currentView: View;
+@@ -17,6 +17,7 @@ const NAV_ITEMS: { view: View; icon: string }[] = [
+   { view: "office", icon: "🏢" },
+   { view: "skills", icon: "📚" },
+   { view: "dashboard", icon: "📊" },
++  { view: "system", icon: "🖥️" },
+   { view: "tasks", icon: "📋" },
+   { view: "settings", icon: "⚙️" },
+ ];
+@@ -42,6 +43,7 @@ export default function Sidebar({
+     office: tr("오피스", "Office", "オフィス", "办公室"),
+     skills: tr("문서고", "Library", "ライブラリ", "文档库"),
+     dashboard: tr("대시보드", "Dashboard", "ダッシュボード", "仪表盘"),
++    system: tr("시스템", "System", "システム", "系统"),
+     tasks: tr("업무 관리", "Tasks", "タスク管理", "任务管理"),
+     settings: tr("설정", "Settings", "設定", "设置"),
+   };
+diff --git a/src/components/SystemStatusPanel.tsx b/src/components/SystemStatusPanel.tsx
+new file mode 100644
+index 0000000..fc4f38c
+--- /dev/null
++++ b/src/components/SystemStatusPanel.tsx
+@@ -0,0 +1,270 @@
++import { useCallback, useEffect, useMemo, useState } from "react";
++import {
++  AlertTriangle,
++  CheckCircle2,
++  Clock,
++  Cpu,
++  Database,
++  RefreshCw,
++  Server,
++  Thermometer,
++} from "lucide-react";
++
++import * as api from "../api";
++import type { SystemMetricsResponse } from "../types";
++
++const AUTO_REFRESH_MS = 5 * 60_000;
++
++function formatBytes(bytes: number): string {
++  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
++  const units = ["B", "KB", "MB", "GB", "TB"];
++  let value = bytes;
++  let idx = 0;
++  while (value >= 1024 && idx < units.length - 1) {
++    value /= 1024;
++    idx += 1;
++  }
++  return `${value.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`;
++}
++
++function formatDuration(totalSeconds: number): string {
++  const sec = Math.max(0, Math.floor(totalSeconds));
++  const days = Math.floor(sec / 86_400);
++  const hours = Math.floor((sec % 86_400) / 3600);
++  const mins = Math.floor((sec % 3600) / 60);
++  if (days > 0) return `${days}d ${hours}h ${mins}m`;
++  if (hours > 0) return `${hours}h ${mins}m`;
++  return `${mins}m`;
++}
++
++function formatCountdown(ms: number): string {
++  const totalSec = Math.max(0, Math.ceil(ms / 1000));
++  const minutes = Math.floor(totalSec / 60);
++  const seconds = totalSec % 60;
++  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
++}
++
++function statusColor(value: number, warn = 70, critical = 90): string {
++  if (value >= critical) return "text-red-400";
++  if (value >= warn) return "text-amber-400";
++  return "text-emerald-400";
++}
++
++function statusBar(value: number, warn = 70, critical = 90): string {
++  if (value >= critical) return "bg-red-500";
++  if (value >= warn) return "bg-amber-500";
++  return "bg-emerald-500";
++}
++
++export default function SystemStatusPanel() {
++  const [data, setData] = useState<SystemMetricsResponse | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [refreshing, setRefreshing] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const [nowMs, setNowMs] = useState(Date.now());
++
++  const loadMetrics = useCallback(async (manual = false) => {
++    if (manual) setRefreshing(true);
++    if (!manual && !data) setLoading(true);
++    try {
++      const next = await api.getSystemMetrics(manual);
++      setData(next);
++      setError(null);
++    } catch (err) {
++      if (api.isApiRequestError(err)) {
++        if (err.code === "manual_refresh_cooldown") {
++          setError("수동 새로고침 쿨다운 중입니다. 잠시 후 다시 시도하세요.");
++        } else if (err.code === "refresh_in_progress") {
++          setError("다른 새로고침 작업이 진행 중입니다.");
++        } else {
++          setError(`시스템 지표를 불러오지 못했습니다 (${err.code ?? err.status}).`);
++        }
++      } else {
++        setError("시스템 지표를 불러오지 못했습니다.");
++      }
++    } finally {
++      setLoading(false);
++      setRefreshing(false);
++    }
++  }, [data]);
++
++  useEffect(() => {
++    void loadMetrics(false);
++    const timer = setInterval(() => {
++      void loadMetrics(false);
++    }, AUTO_REFRESH_MS);
++    return () => clearInterval(timer);
++  }, [loadMetrics]);
++
++  useEffect(() => {
++    const timer = setInterval(() => setNowMs(Date.now()), 1000);
++    return () => clearInterval(timer);
++  }, []);
++
++  const timing = useMemo(() => {
++    if (!data) {
++      return { nextAutoMs: 0, manualRemainingMs: 0 };
++    }
++    const nextAutoMs = Math.max(0, data.cache_expires_at - nowMs);
++    const elapsedFromGenerated = Math.max(0, nowMs - data.generated_at);
++    const manualRemainingMs = Math.max(0, data.manual_refresh.cooldown_remaining_ms - elapsedFromGenerated);
++    return { nextAutoMs, manualRemainingMs };
++  }, [data, nowMs]);
++
++  if (loading && !data) {
++    return (
++      <div className="flex h-full w-full items-center justify-center p-12">
++        <div className="flex flex-col items-center gap-4">
++          <RefreshCw className="h-10 w-10 animate-spin text-blue-400" />
++          <p className="text-sm font-semibold text-blue-300">시스템 지표를 불러오는 중...</p>
++        </div>
++      </div>
++    );
++  }
++
++  if (!data) {
++    return (
++      <div className="flex h-full w-full items-center justify-center p-12">
++        <div className="game-panel max-w-xl p-8 text-center">
++          <AlertTriangle className="mx-auto mb-3 h-10 w-10 text-red-400" />
++          <p className="mb-4 text-sm text-red-300">{error ?? "시스템 지표를 가져오지 못했습니다."}</p>
++          <button
++            type="button"
++            onClick={() => void loadMetrics(false)}
++            className="rounded-md border border-red-400/40 bg-red-500/10 px-4 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/20"
++          >
++            다시 시도
++          </button>
++        </div>
++      </div>
++    );
++  }
++
++  const { metrics } = data;
++  const hasWarnings = data.warnings.length > 0;
++
++  return (
++    <div className="space-y-6 p-4 sm:p-6" style={{ color: "var(--th-text-primary)" }}>
++      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
++        <div>
++          <div className="mb-1 flex items-center gap-2">
++            <Server className="h-5 w-5 text-blue-400" />
++            <h2 className="text-2xl font-black tracking-tight sm:text-3xl">System Panel</h2>
++          </div>
++          <p className="text-xs sm:text-sm" style={{ color: "var(--th-text-muted)" }}>
++            {metrics.host.hostname} · {metrics.host.platform} {metrics.host.release} ({metrics.host.arch})
++          </p>
++        </div>
++        <div className="flex items-center gap-2 self-start sm:self-auto">
++          <div className="rounded-md border border-slate-500/30 bg-slate-700/20 px-3 py-1.5 text-xs">
++            자동 갱신 {formatCountdown(timing.nextAutoMs)}
++          </div>
++          <button
++            type="button"
++            onClick={() => void loadMetrics(true)}
++            disabled={refreshing || timing.manualRemainingMs > 0 || data.manual_refresh.in_progress}
++            className="inline-flex items-center gap-2 rounded-md border border-blue-400/40 bg-blue-500/10 px-3 py-1.5 text-xs font-semibold text-blue-100 transition hover:bg-blue-500/20 disabled:cursor-not-allowed disabled:opacity-50"
++          >
++            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? "animate-spin" : ""}`} />
++            {timing.manualRemainingMs > 0 ? `수동 ${formatCountdown(timing.manualRemainingMs)}` : "수동 새로고침"}
++          </button>
++        </div>
++      </div>
++
++      {error && (
++        <div className="rounded-md border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
++          {error}
++        </div>
++      )}
++
++      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
++        <div className="game-panel p-4">
++          <div className="mb-2 flex items-center justify-between">
++            <Cpu className="h-4 w-4 text-cyan-300" />
++            <span className={`text-xl font-black ${statusColor(metrics.cpu.load_percent_1m)}`}>
++              {metrics.cpu.load_percent_1m.toFixed(1)}%
++            </span>
++          </div>
++          <p className="mb-2 text-[11px] uppercase tracking-wider text-slate-400">CPU (1m load)</p>
++          <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
++            <div
++              className={`h-full ${statusBar(metrics.cpu.load_percent_1m)}`}
++              style={{ width: `${Math.max(0, Math.min(100, metrics.cpu.load_percent_1m))}%` }}
++            />
++          </div>
++        </div>
++
++        <div className="game-panel p-4">
++          <div className="mb-2 flex items-center justify-between">
++            <Database className="h-4 w-4 text-purple-300" />
++            <span className={`text-xl font-black ${statusColor(metrics.memory.used_percent, 70, 90)}`}>
++              {metrics.memory.used_percent.toFixed(1)}%
++            </span>
++          </div>
++          <p className="mb-2 text-[11px] uppercase tracking-wider text-slate-400">Memory</p>
++          <div className="text-xs text-slate-300">
++            {formatBytes(metrics.memory.used_bytes)} / {formatBytes(metrics.memory.total_bytes)}
++          </div>
++        </div>
++
++        <div className="game-panel p-4">
++          <div className="mb-2 flex items-center justify-between">
++            <Thermometer className="h-4 w-4 text-amber-300" />
++            <span className={`text-xl font-black ${statusColor(metrics.temperature.celsius ?? 0, 65, 80)}`}>
++              {metrics.temperature.supported && metrics.temperature.celsius != null
++                ? `${metrics.temperature.celsius.toFixed(1)}°C`
++                : "N/A"}
++            </span>
++          </div>
++          <p className="mb-2 text-[11px] uppercase tracking-wider text-slate-400">Temperature</p>
++          <div className="text-xs text-slate-300">
++            {metrics.temperature.supported
++              ? (metrics.temperature.source ?? "sensor")
++              : "센서 미지원 또는 읽기 불가"}
++          </div>
++        </div>
++
++        <div className="game-panel p-4">
++          <div className="mb-2 flex items-center justify-between">
++            <Clock className="h-4 w-4 text-indigo-300" />
++            <span className="text-xl font-black text-indigo-200">
++              {formatDuration(metrics.uptime.seconds)}
++            </span>
++          </div>
++          <p className="mb-2 text-[11px] uppercase tracking-wider text-slate-400">Uptime</p>
++          <div className="text-xs text-slate-300">PID {metrics.process.pid}</div>
++        </div>
++      </div>
++
++      <div className="game-panel p-4">
++        <div className="mb-2 flex items-center gap-2 text-xs">
++          {hasWarnings ? (
++            <>
++              <AlertTriangle className="h-4 w-4 text-amber-300" />
++              <span className="font-semibold text-amber-200">경고 {data.warnings.length}건</span>
++            </>
++          ) : (
++            <>
++              <CheckCircle2 className="h-4 w-4 text-emerald-300" />
++              <span className="font-semibold text-emerald-200">정상</span>
++            </>
++          )}
++          <span className="text-slate-400">
++            · 마지막 갱신 {new Date(data.generated_at).toLocaleString()}
++          </span>
++          <span className="text-slate-400">· source: {data.source}</span>
++        </div>
++        {hasWarnings && (
++          <ul className="space-y-1 text-xs text-amber-100">
++            {data.warnings.map((warning, idx) => (
++              <li key={`${warning.code}-${idx}`}>
++                [{warning.code}] {warning.message}
++                {warning.detail ? ` (${warning.detail})` : ""}
++              </li>
++            ))}
++          </ul>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/types/index.ts b/src/types/index.ts
+index a3ba2f0..96868cc 100644
+--- a/src/types/index.ts
++++ b/src/types/index.ts
+@@ -186,6 +186,66 @@ export interface CompanyStats {
+   recent_activity: Array<Record<string, unknown>>;
+ }
+ 
++// System Metrics
++export interface SystemMetricWarning {
++  code: string;
++  message: string;
++  detail?: string;
++}
++
++export interface SystemMetricsResponse {
++  status: "ok" | "partial" | "stale";
++  generated_at: number;
++  cache_ttl_seconds: number;
++  warnings: SystemMetricWarning[];
++  metrics: {
++    host: {
++      hostname: string;
++      platform: string;
++      release: string;
++      arch: string;
++    };
++    cpu: {
++      cores: number;
++      load_average_1m: number;
++      load_average_5m: number;
++      load_average_15m: number;
++      load_percent_1m: number;
++    };
++    memory: {
++      total_bytes: number;
++      free_bytes: number;
++      used_bytes: number;
++      used_percent: number;
++    };
++    uptime: {
++      seconds: number;
++    };
++    temperature: {
++      supported: boolean;
++      celsius: number | null;
++      source: string | null;
++    };
++    process: {
++      pid: number;
++      uptime_seconds: number;
++      rss_bytes: number;
++      heap_total_bytes: number;
++      heap_used_bytes: number;
++    };
++  };
++  cached: boolean;
++  stale: boolean;
++  source: "cache" | "fresh" | "manual_refresh" | "stale_cache";
++  age_ms: number;
++  cache_expires_at: number;
++  manual_refresh: {
++    cooldown_ms: number;
++    cooldown_remaining_ms: number;
++    in_progress: boolean;
++  };
++}
++
+ // SubTask
+ export type SubTaskStatus = 'pending' | 'in_progress' | 'done' | 'blocked';
+ 
